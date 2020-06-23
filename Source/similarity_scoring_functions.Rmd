@@ -5,6 +5,29 @@ output: html_notebook
 
 
 ```{r}
+if (!require(pacman)) {
+  
+  install.packages("pacman")
+  library(pacman)
+}
+
+p_load(tidyverse)
+p_load(Rcpp)
+p_load(WGCNA)
+p_load(mpmi)
+p_load(energy)
+p_load(minerva)
+p_load(mpmi)
+
+
+## Install RIC
+# a port of Simone Romano's C++ implementation of the Randomized Information Coefficient to R.
+# Port written by Loïc Thibalt (loic.thibaut@unsw.edu.au)
+# https://github.com/ialuronico/RandomizedInformationCoefficient
+p_load(devtools)
+install_github("tiboloic/RIC")
+p_load(RIC)
+
 
 ```
 
@@ -274,7 +297,7 @@ euclidean_distance <- function(x, y) {
 ```{r}
 ## Example: Dmax(rlnorm(100), rlnorm(100))
 ## Output value should be greater than 1
-## Dmax function Contributed by Loic Thibaut
+## Dmax function Contributed by Loic Thibaut (loic.thibaut@unsw.edu.au)
 Dmax = function(x,y) {
   
   if( length(x) != length(y)) {
@@ -539,6 +562,153 @@ run_peak_score_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  numb
 	return( dcor_return_matrix)
 	
 }
+
+```
+
+
+# Co-apex scores
+```{r}
+
+#' @name calculate_co_apex_score_one_dataset
+#' @Description Calculate co-apex score for an input peaks table, output from the Prince software. Euclidean distance between the closest (μ, σ) pairs, where μ and σ are Gaussian parameters fitted to ci and c j . For example, if c i is fit by two Gaussians with (μ, σ) equal to (5, 1) and (45, 3), and c j is fit by one Gaussian with parameters (45, 2). Calculate the euclidean distance between c i and c j. Thus chromatograms with at least one pair of similar Gaussian peaks will have a low (similar) Co-apex score.
+#' @param input_table The output from the Prince peak picking tool but with an additional expt_name column (see the parameter 'expt_name_col').
+#' @param protein_name_col  a string indicating the column name
+#' @param exp_name_col a string indicating the experiment tag column. It is to enable comparing the table with itself to define protein pairs.
+#' @return an edge list with the followig columns: column_a, column_b, and the Co-apex score
+#' @reference Scott NE et al. (2015) Development of a computational framework for the analysis of protein correlation profiling and spatial proteomics experiments. J Proteomics. 118:112-29.
+
+calculate_co_apex_score_one_dataset <- function( input_table, protein_name_col, expt_name_col  ) {
+	
+	column_a <- as.name( paste0( protein_name_col, ".x" ) )
+	column_b <- as.name( paste0( protein_name_col, ".y") ) 
+	
+	##  I wanted to be able to use enquo and UQ for the expt_name_col too, but don't have an idea yet, so currently stick with string.
+	column_a_quoted <- enquo(column_a)
+	column_b_quoted <- enquo(column_b)
+	
+	input_table_filtered <- input_table
+	
+	
+		compare_peaks_table <- input_table_filtered %>%
+		                       dplyr::inner_join( input_table_filtered, by= expt_name_col )  %>%
+							   dplyr::filter( !!column_a_quoted > !!column_b_quoted ) 
+		
+		compare_peaks_table_dist <-  compare_peaks_table %>%
+									 dplyr::mutate( co_apex = sqrt( (Center.x - Center.y)^2 + ( abs(Width.x) - abs(Width.y))^2/2 ) ) 
+		
+		
+		compare_peaks_table_dist_min <- compare_peaks_table_dist %>%
+									    dplyr::select( UQ(column_a_quoted), UQ(column_b_quoted),  co_apex )%>%
+									    dplyr::group_by ( UQ(column_a_quoted), UQ(column_b_quoted)) %>%
+									    dplyr::summarise( co_apex= min(co_apex)  ) %>%
+									    dplyr::ungroup()
+		
+		#print(head ( compare_peaks_table_dist_min))
+		
+		compare_peaks_table_dist_min_joined <- compare_peaks_table_dist %>%
+		 	dplyr::inner_join( compare_peaks_table_dist_min, 
+		 					   by=c( as.character( column_a),  as.character(column_b), "co_apex"))  %>%
+		 	dplyr::select( UQ(column_a_quoted), peak_number.x, UQ(column_b_quoted),  peak_number.y,  co_apex   ) %>%
+		 	dplyr::group_by(UQ(column_a_quoted), UQ(column_b_quoted ) ) %>%
+		 	dplyr::mutate( pair_distance_id = row_number() )  %>%
+		 	## Remove entries with distance > 0, in case some proteins have different 
+		 	## Uniprot_acc but are duplicated proteins and therefore has same PCP profiles
+            dplyr::filter( ! ( co_apex == 0 &  pair_distance_id > 1) ) %>%
+		 	dplyr::select( - pair_distance_id) %>%
+		 	dplyr::ungroup() %>%
+		 	dplyr::distinct()
+		 
+		 #print(head( compare_peaks_table_dist_min_joined))
+		
+		return( compare_peaks_table_dist_min_joined)
+}
+
+
+
+
+#' @name  run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix
+#' @description Given a table with a protein A column, protein B column and a score column (long format), convert into a square matrix. The diagonal values are filled in using user specified value(s) (see diagonal_score parameter).
+#' @param list_of_pairs: A table containing the following columns Protein A accession (protein_a), Protein B accession (protein_b), and the correlation score column. Takes the output from the function 'calculate_co_apex_score_one_dataset'
+#' @param protein_a_column Name of protein A column 
+#' @param protein_b_column Name of protein B column 
+#' @param score_column Name of score column
+#' @param diagonal_score: Score to fill in for the diagonal part of the square matrix. 
+run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix <- function(list_of_pairs, protein_a_column, protein_b_column, score_column, diagonal_score=1) {
+	
+	## Top half of interactions matrix
+	selected_columns <- list_of_pairs %>%
+		dplyr::select( one_of( c( protein_a_column, protein_b_column, score_column)))
+	
+	if ( ncol( selected_columns) != 3) {
+		stop( "run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix: Something wrong with the column names.")
+	}
+	
+	## Bottom half of interactions matrix 
+	list_of_pairs_part_2 <- list_of_pairs %>%
+		dplyr::select( one_of( c( protein_a_column, protein_b_column, score_column))) %>%
+		dplyr::rename_( .dots= setNames( as.list( protein_b_column ), c("temp"))) %>% 
+		dplyr::rename_( .dots= setNames( as.list( protein_a_column ), c(protein_b_column))) %>% 
+		dplyr::rename_( .dots= setNames( as.list( "temp" ), c(protein_a_column))) 
+	
+	## The diagonal of the matrix, which is all equal to the 'diagonal_score'
+	list_of_all_proteins <- as.vector( unique(c( as.vector(unlist(list_of_pairs[,1])), as.vector(unlist(list_of_pairs[,2])))))
+	
+	# print(list_of_all_proteins )
+	# print( paste( "length of list_of_all_proteins =",  length( list_of_all_proteins)) )
+	
+	if( length( diagonal_score) == 1) {
+		
+		list_of_pairs_part_3 <- data.frame( list_of_all_proteins, 
+											list_of_all_proteins, 
+											rep(diagonal_score, length(list_of_all_proteins))   )
+	} else if (  length( diagonal_score) == length(list_of_all_proteins)) {
+		
+		list_of_pairs_part_3 <- data.frame( list_of_all_proteins, 
+											list_of_all_proteins, 
+											diagonal_score   )
+	} else {
+		
+		stop("run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix: The input to diagonal_score should be of length 1 or the length of the number of proteins present in the input matrix.")
+	}
+	
+	colnames( list_of_pairs_part_3  ) <- c(protein_a_column, protein_b_column, score_column )
+	
+	## Combine top, bottom and diagonal 
+	list_of_pairs <- dplyr::bind_rows( list_of_pairs, list_of_pairs_part_2, list_of_pairs_part_3)
+	
+	results_matrix <- list_of_pairs %>%
+						tidyr::spread( protein_b_column, score_column)
+	
+	new_row_names_to_use <- unlist( results_matrix[, protein_a_column] ) 
+	
+	results_matrix <- as.data.frame( results_matrix[, 2:ncol(results_matrix)] )
+	
+	rownames( results_matrix) <-  new_row_names_to_use
+	
+	results_matrix <- as.matrix(results_matrix)
+	
+	return( results_matrix)
+	
+}
+
+
+
+calculate_co_apex_score <-  function(input_table) {
+	
+  co_apex_scores <- calculate_co_apex_score_one_dataset( input_table, "Protein name", "expt_name") 
+  
+	co_apex_scores_cleaned <- co_apex_scores %>% 
+							  dplyr::select( -peak_number.x, -peak_number.y ) %>%
+							  dplyr::rename( uniprot_acc_a = "Protein name.x", uniprot_acc_b = "Protein name.y") %>%
+							  dplyr::distinct()
+	
+	co_apex_scores_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix(co_apex_scores_cleaned, 
+																								    "uniprot_acc_a", "uniprot_acc_b", 
+																								    "co_apex", diagonal_score=0) 
+	
+	return(co_apex_scores_matrix)
+}
+
 
 ```
 

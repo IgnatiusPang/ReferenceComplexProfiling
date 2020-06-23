@@ -1,0 +1,48 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+
+## Read the peak picked file
+load_prince_picked_peaks <- function(gaussian_output_file) {
+  
+  
+  gaussian_output <- read.csv ( gaussian_output_file, header=FALSE, skip=1, stringsAsFactors = FALSE)
+  
+  colnames( gaussian_output) <- c( "Guassian index number", "Protein_number", "Replicate", "Protein name",
+                                   "Height", "Center", "Width", "SSE", "adjrsquare", "Complex size", "Column.To.Drop")
+  
+  gaussian_output <- dplyr::select ( gaussian_output, -Column.To.Drop )
+  
+  gaussian_output <- gaussian_output %>%
+    dplyr::rename( "Protein.name"= "Protein name" )
+  
+  return( gaussian_output)
+} 
+
+
+
+## Convert all the peaks data into a abundance data per fraction per protein
+convert_peaks_to_abundance <- function( gaussian_output, gaussian_index_column, protein_name_column, peak_number_column, 
+										replicate_column, fraction_number_column  ,  number_of_fractions=70 ) {
+  
+  ## Generate the fraction number for use in reconctructing the peaks
+  proteins_combination <- purrr::cross_df( list( Protein.name=unique( unlist(gaussian_output[, protein_name_column] )), Fraction_Num=1:number_of_fractions) )
+  
+  ## Apparently the Width can be negative so you can use absolute value to make it positive, but it is ok. 
+  gaussian_output_individual_peaks <- gaussian_output %>%
+    dplyr::full_join ( proteins_combination, by=protein_name_column ) %>%
+    dplyr::mutate( LFQ = 
+                     Height *dnorm( Fraction_Num, mean= Center, sd= abs(Width)/sqrt(2)) *  ( (abs(Width) /sqrt(2) * sqrt( 2*pi)  ) ) 
+    ) %>%
+  	dplyr::mutate( protein_peak_id =  paste0(  UQ(as.name(protein_name_column)), "_", UQ(as.name(peak_number_column)) ) ) %>%
+    dplyr::select (one_of ( c( "protein_peak_id", protein_name_column, gaussian_index_column, replicate_column, fraction_number_column, "LFQ"))) 
+  
+  return( gaussian_output_individual_peaks)
+  
+}
+```
+
