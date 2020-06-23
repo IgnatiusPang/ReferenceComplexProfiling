@@ -1,0 +1,165 @@
+---
+title: "Rescaling Fractions"
+output: html_notebook
+---
+
+```{r}
+if (!require(pacman)) {
+  
+  install.packages("pacman")
+  library(pacman)
+}
+
+p_load(tidyverse)
+```
+
+
+```{r}
+################################################################################################################################
+## Functions for re-scaling the number of fractions to a smaller number of fractions, preserving the shape of the PCP profile.
+## Abundance level will change as the scaling uses area under the curve calculations (e.g. integration).
+## Using Loic's solution for re-scaling the fractions
+
+#' @description taking the same example of 7 buckets to 5 buckets, with heights 1, 5, 3, 7, 6, 4, 5.
+#' 
+#' Let the 7 buckets be labeled by integers from 1 to 7 and the 5 buckets labeled by letters from a to e:
+#' If we use a simple proportionality rule:
+#'   
+#' height(a) = height(1) + 0.4 * height(2)
+#' height(b) = 0.6 * height(2) + 0.8 * height(3)
+#' height(c) = 0.2 * height(3) + height(4) + 0.2 * height(5)
+#' height(d) = 0.8 * height(5) + 0.6 * height(6)
+#' height(e) = 0.4 * height(6) + height(7)
+#' 
+#' @param obs The input vector with the LFQ values for each fraction. The observed (existing) number of fractions is calculated from this vector.
+#' @param target_num_fractions  The target (new) number of fractions. This value must be less than or equal to the length of the input 'obs' vector. 
+#' @return A vector with the LFQ values rescaled to new number of fractions. 
+rescale_fractions_by_proportions <- function( obs, target_num_fractions ) {
+  
+  # initial number of fractions "buckets"
+  obs_num_fractions <- length(obs)
+  
+  # target number of fractions, we assume p <= n
+  if(  target_num_fractions >  obs_num_fractions) {
+    stop(paste( "rescale_fractions: Error! Target number of fractions ", 
+                target_num_fractions, 
+                " is greater than the current number of fractions", obs_num_fractions, "." ) )
+  }
+  
+  if(target_num_fractions > obs_num_fractions) { stop("Only valid for sub-sampling") }
+  
+  # proportion of rescaling
+  prop <- obs_num_fractions/target_num_fractions
+  
+  # function to compute how much water has flowed since t=0 when bucket i starts
+  # I think that is what you called the integral
+  convert <- function(i) {
+    if (i==0) { return(0) }
+    sum(obs[1:floor(i*prop)]) + (i*prop - floor(i*prop)) * obs[ceiling(i*prop)]
+  }
+  
+  # result
+  obs.rescaled <- diff(sapply(0:target_num_fractions, convert))
+  
+  return( obs.rescaled)
+}
+```
+
+```{r}
+#' Given a PCP input table with data for one protein, rescale the fractions from orginal number of fractions to new number of fractions.
+#' @param input_table: This table has already been processed with gather so that there is a column for fraction number, and another column for LFQ abundance. The input table should only have one protein.
+#' @param original_num_fractions: Original number of fractions
+#' @param new_num_fractions: New number of fractions to rescale to 
+#' @param protein_accession_col_name: protein accession column name
+#' @param fraction_num_col_name: Fraction number column name
+#' @param lfq_col_name: LFQ protein abundance column name
+#' @param type:  linear curve estimation
+rescale_fractions <- function( input_table, original_num_fractions, new_num_fractions, 
+                               protein_accession_col_name , fraction_num_col_name, lfq_col_name, 
+                               type="linear") {
+  
+  if( nrow(input_table ) < 2) {
+    stop ( "rescale_fractions: Number of fractions needs to be two or more. Stop because this is not satistified.\n")
+  }
+  
+  my_x <- input_table %>% pull ( fraction_num_col_name) %>% as.numeric()
+  my_y <- input_table %>% pull ( lfq_col_name ) %>% as.numeric()
+  
+  # print(paste( "my_x =", paste(my_x, collapse=", ")))
+  
+  ## Check numbers are equally spaced
+  spacing <- diff(my_x)
+  if ( ! all( spacing %in% diff(my_x) ) ) {
+    stop ("x value are not equally spaced")
+  }
+  
+  rescaled_lfq <- rescale_fractions_by_proportions(my_y, new_num_fractions)
+  
+  #print( paste("Rescaled LFQ:", paste(rescaled_lfq, collapse=" ") ) )
+  #print (sum(rescaled_lfq))
+  
+  protein_accessions <- as.vector(t(input_table[, protein_accession_col_name])) 
+  protein_accessions <- rep( protein_accessions[1], new_num_fractions  )
+  
+  return_table <- data.frame( protein_accessions, 1:new_num_fractions,  rescaled_lfq )
+  colnames( return_table) <- c( protein_accession_col_name, fraction_num_col_name, lfq_col_name)
+  
+  return( return_table )
+}
+```
+
+```{r}
+#' Function: rescale_fractions_all
+#' Given a PCP input table with data for multiple proteins, rescale the fractions from orginal number of fractions to new number of fractions.
+#' @param input_table: This table has a column for protein accession and one column per fraction.
+#' @param original_num_fractions: Original number of fractions
+#' @param new_num_fractions: New number of fractions to rescale to 
+#' @param protein_accession_col_name: protein accession column name
+#' @param fraction_num_col_name: Fraction number column name
+#' @param lfq_col_name: LFQ protein abundance column name
+#' @param type: spline or linear curve estimation
+
+rescale_fractions_all <- function( input_table, original_num_fractions, new_num_fractions, 
+                                   protein_accession_col_name , fraction_num_col_name, lfq_col_name, 
+                                   type="spline" ) {
+  
+  column_names <- setdiff(  colnames( input_table), protein_accession_col_name)
+  
+  #print(column_names)
+  
+  list_of_protein_accetions <- unique( as.vector( t( input_table[, protein_accession_col_name]) ))
+  
+  print(head( list_of_protein_accetions))
+  
+  input_table_gather <- input_table %>%
+    tidyr::gather_(  fraction_num_col_name, lfq_col_name, column_names  ) 
+  
+  # print(head( input_table_gather))
+  
+  get_table_for_one_protein <-  function( protein_acc) { 
+    filtered_table <- input_table_gather %>% dplyr::filter_at( vars(protein_accession_col_name), any_vars(. == protein_acc)  )
+    return(filtered_table )
+  }
+  
+  list_of_tables <- purrr::map( list_of_protein_accetions, get_table_for_one_protein) 
+  
+  my_partial_rescale_fractions <-  purrr::partial(rescale_fractions,  
+                                                  original_num_fractions=original_num_fractions, 
+                                                  new_num_fractions=new_num_fractions, 
+                                                  protein_accession_col_name=protein_accession_col_name , 
+                                                  fraction_num_col_name=fraction_num_col_name, 
+                                                  lfq_col_name=lfq_col_name, 
+                                                  type=type)
+  
+  rescaled_tables <- purrr::map( list_of_tables, my_partial_rescale_fractions )  %>% 
+    dplyr::bind_rows() %>%
+    dplyr::arrange_( protein_accession_col_name, fraction_num_col_name )
+  
+  rescaled_tables_spread <- rescaled_tables %>%
+    tidyr::spread_( fraction_num_col_name, lfq_col_name)
+  
+  return( rescaled_tables_spread)  
+}
+```
+
+

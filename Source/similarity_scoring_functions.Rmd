@@ -1,0 +1,614 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+
+```
+
+
+## Correlation functions
+```{r}
+#' @name master_correlation_function
+#' @param input_pcp_file A file with the  column as the protein name, all other rows are LFQ values for eluted fractions in sequential order 
+#' @param type The type of correlation matrics used. 
+#' @param number_of_threads The number of CPU threads used to calculate one matrix
+#' @value A matrix object representing the correlation scores between every pair of proteins. It should be a symmetrical square matrix. 
+master_correlation_function <- function(input_pcp_matrix, type, number_of_threads=1 ) {
+  
+  input_pcp_matrix <- log10(input_pcp_matrix +1)
+  
+  if (type %in% c( "Pearson") ) {
+    enableWGCNAThreads(nThreads = number_of_threads)
+    return ( WGCNA::cor(input_pcp_matrix, method="pearson" , use="all.obs") ) 
+  } else if ( type== "Spearman") {
+    enableWGCNAThreads(nThreads = number_of_threads)
+    return ( WGCNA::cor(input_pcp_matrix, method="spearman" , use="all.obs") ) 
+  } else if( type== "Kendall") {
+    enableWGCNAThreads(nThreads = number_of_threads)
+    return ( WGCNA::cor(input_pcp_matrix, method="kendall" , use="all.obs") ) 
+  } else if ( type == "MIC" ) {
+    return ( run_mine_on_one_matrix(input_pcp_matrix,  number_of_threads=number_of_threads) ) 
+  } else if ( type == "GMIC" ) {
+    return ( run_gmic_on_one_matrix(input_pcp_matrix,  number_of_threads=number_of_threads) ) 
+  } else if ( type == "TIC" ) {
+    return ( run_tic_on_one_matrix(input_pcp_matrix,  number_of_threads=number_of_threads) ) 
+  } else if ( type %in% c( "Distance")   ) {
+    return ( run_dcor_on_one_matrix_foreach_focused(input_pcp_matrix,  number_of_threads=number_of_threads))
+  } else if  ( type %in% c( "BCMI") ) {
+    
+    # export OMP_NUM_THREADS=8
+    Sys.setenv( OMP_NUM_THREADS=number_of_threads)
+    # Sys.getenv("OMP_NUM_THREADS")
+    return_matrix <- cmi(input_pcp_matrix)$bcmi
+    
+    colnames(return_matrix ) <- colnames(input_pcp_matrix )
+    rownames(return_matrix ) <- colnames(input_pcp_matrix )
+    
+    return ( return_matrix)
+    
+  } else if  ( type %in% c("MI")) {
+    # export OMP_NUM_THREADS=8
+    Sys.setenv( OMP_NUM_THREADS=number_of_threads)
+    # Sys.getenv("OMP_NUM_THREADS")
+    return_matrix <- cmi(input_pcp_matrix)$mi
+    
+    colnames(return_matrix ) <- colnames(input_pcp_matrix )
+    rownames(return_matrix ) <- colnames(input_pcp_matrix )
+    
+    return ( return_matrix )
+    
+  } else if ( type %in% c( "Euclidean")) {
+    enableWGCNAThreads(nThreads = number_of_threads)
+    
+    input_pcp_matrix_norm <- apply ( input_pcp_matrix, 2, function(x) { x/max(x)} ) 
+    
+    return( adjacency(input_pcp_matrix_norm, distOptions = "method = 'euclidean'") )
+  } else if ( type == "RIC" ) {
+    return (  run_ric_on_one_matrix_foreach_focused (input_pcp_matrix,  number_of_threads=number_of_threads ) )
+  } else if ( type == "DMax") {
+    return( run_dmax_on_one_matrix_foreach_focused(input_pcp_matrix,  number_of_threads=number_of_threads) )  
+  } else if ( type == "Jaccard") {
+  	return( run_jaccard_similarity_on_one_matrix_foreach_focused(input_pcp_matrix,  number_of_threads)  )
+  } else if ( type == "Apex") {
+  	return( run_apex_score_on_one_matrix_foreach_focused(input_pcp_matrix,  number_of_threads) )
+  } else if ( type == "NCC") {
+  	return( run_ncc_on_one_matrix_foreach_focused(input_pcp_matrix,  number_of_threads) )
+  } else if ( type == "Peak_score") {
+  	return( run_peak_score_on_one_matrix_foreach_focused(input_pcp_matrix,  number_of_threads) )
+  } else {
+  	stop( "master_correlation_function: Type of correlation score not supported.")
+  }
+
+}
+```
+
+# MIC, TIC, and GMIC
+```{r}
+
+## Run MIC correlation 
+run_mine_on_one_matrix <- function(input_pcp_matrix,  number_of_threads)  { 
+	result_table <- minerva::mine(input_pcp_matrix, n.cores=number_of_threads) 
+	
+	mic_values <- result_table$MIC
+	
+	return( mic_values)
+	
+}
+
+
+run_tic_on_one_matrix <- function(input_pcp_matrix,  number_of_threads)  { 
+	result_table <- minerva::mine(input_pcp_matrix, n.cores=number_of_threads) 
+	
+	mic_values <- result_table$TIC
+	
+	return( mic_values)
+	
+}
+
+
+run_gmic_on_one_matrix <- function(input_pcp_matrix,  number_of_threads)  { 
+	result_table <- minerva::mine(input_pcp_matrix, n.cores=number_of_threads) 
+	
+	mic_values <- result_table$GMIC
+	
+	return( mic_values)
+	
+}
+
+
+#' @name calculate_minerva
+#' @param x a vector of number
+#' @param y a vector of number
+#' @param method Method should be either MIC, TIC, or GMIC.
+#' @number_of_threads Number of threads for parallel calculation
+#' @value A numeric value, representing the correlation as calculated by the algorithm specified by input 'method'.
+#  calculate_minerva( 1:50, (1:50)^2, method="MIC", number_of_threads=4   )
+#  calculate_minerva( rnorm(50), rnorm(50), method="MIC", number_of_threads=4   )
+calculate_minerva <- function( x, y, method="MIC", number_of_threads=1 ) {
+	
+	if( ! method %in% c( "MIC", "GMIC", "TIC")) {
+		stop( "calculate_minerva: Type should be either MIC, TIC, or GMIC.")
+	}
+	
+	result_table <- minerva::mine(cbind( x, y ), n.cores=number_of_threads) 
+	
+	cor_values <- result_table[[method]]
+	
+	return( cor_values["x", "y"] ) 
+} 
+
+```
+
+
+
+# BCMI and MI
+```{r}
+
+#' @name calculate_mutual_information
+#' @description Wrapper for the 'cmi' function from the 'mpmi' library. 
+#' @param x a vector of number
+#' @param y a vector of number
+#' @param method Method should be either MI or BCMI
+#' @number_of_threads Number of threads for parallel calculation
+#' @value A numeric value, representing the correlation as calculated by the algorithm specified by input 'method'.
+#  calculate_mutual_information( 1:50, (1:50)^2, method="MI", number_of_threads=4   )
+#  calculate_mutual_information( rnorm(50), rnorm(50), method="MI", number_of_threads=4   )
+#  calculate_mutual_information( rnorm(50), rnorm(50), method="BCMI", number_of_threads=4   )
+calculate_mutual_information <- function( x, y, method="BCMI", number_of_threads=1 ) {
+	
+	if( ! method %in% c( "BCMI", "MI")) {
+		stop( "calculate_mutual_information: Type should be either BCMI or MI")
+	}
+	
+	Sys.setenv( OMP_NUM_THREADS=number_of_threads)
+	
+	result_table <- cmi(cbind( x=x, y=y )) 
+	
+	my_method <- "bcmi"
+	
+	if( method=="MI") {
+		my_method <- "mi"
+	} else if ( method=="BCMI") {
+		my_method <- "bcmi"
+	}
+	
+	cor_values <- result_table[[my_method]]
+	
+	return( cor_values[1, 2] )  # 
+} 
+
+
+
+```
+
+## Distance correlation
+```{r}
+
+#############
+
+#' @name run_dcor_on_one_matrix_foreach_focused_parallel_part
+#' @description Run distance correlation on the input PCP matrix. 
+#' @param input_pcp_matrix: Uses the output from the 'read_input_pcp_file' function. It is a matrix with column names representing proteins and row names representing the PCP fraction number.
+#' @param number_of_threads: Number of CPUs dedicated to the analysis
+#' @value A numeric matrix
+
+run_dcor_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  number_of_threads)  { 
+  
+  # list_of_pairs <- run_dcor_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads )
+  
+  # list_of_pairs <- dplyr::bind_cols(list_of_pairs,  data.frame( dcor=results) ) %>% as.data.frame()
+  tic()
+  list_of_pairs <- run_corr_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads, 
+  																	  .export=c(), .packages=c("energy", 'tidyverse'),  FUNC=dcor,
+  																	  protein_a_column="protein_a", protein_b_column="protein_b", 
+  																	  score_column="dcor")	
+  toc()
+  
+  tic()
+  dcor_return_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix( list_of_pairs, "protein_a", "protein_b", "dcor", diagonal_score=1)
+  toc()
+  
+  return( dcor_return_matrix)
+  
+}
+```
+
+
+
+# RIC
+```{r}
+#' @param input_pcp_matrix: Uses the output from the 'read_input_pcp_file' function. It is a matrix with column names representing proteins and row names representing the PCP fraction number.
+#' @param number_of_threads: Number of CPUs dedicated to the analysis
+#' @value A numeric matrix
+run_ric_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  number_of_threads, Kr=200, Dmax=NULL)  { 
+  
+  if( is.null(Dmax) ) {
+		num_records <- length(input_pcp_matrix[,1])
+		Dmax <- floor(sqrt(num_records)) - 1;
+  }
+	
+  tic()
+  list_of_pairs <- run_corr_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads, .export=c(),
+																			.packages=c('Rcpp', "RIC", 'tidyverse'),
+																			FUNC=RIC,
+																			protein_a_column="protein_a", protein_b_column="protein_b", 
+																			score_column="RIC", 
+																			Kr=Kr, Dmax=Dmax)
+  toc()
+  
+  tic()
+  ric_return_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix( list_of_pairs, "protein_a", "protein_b", "RIC", 
+  																				  diagonal_score=1)
+  toc()
+  
+  return( ric_return_matrix)
+  
+}
+```
+
+# Euclidean distance 
+```{r}
+#' @description Calculates the euclidean distance. Normalize x and y vector first. 
+euclidean_distance <- function(x, y) { 
+
+  
+	if( length(x) != length(y)) {
+		stop("euclidean_distance: length of x is not equal to length of y. Abort.")
+	}
+  
+  x_norm <- x/max(x)
+  y_norm <- y/max(y)
+	
+	return( sqrt(sum((x_norm - y_norm) ^ 2)))
+	
+} 
+
+```
+
+
+
+# DMax
+```{r}
+## Example: Dmax(rlnorm(100), rlnorm(100))
+## Output value should be greater than 1
+## Dmax function Contributed by Loic Thibaut
+Dmax = function(x,y) {
+  
+  if( length(x) != length(y)) {
+    stop("Dmax: length of x is not equal to length of y. Abort.")
+  }
+  
+  c.x = cumsum(x)
+  c.y = cumsum(y)
+  max(abs(c.x/max(c.x)-c.y/max(c.y)))
+  
+  
+}
+
+Dmax_positive <- function( x, y ) {
+
+  if( length(which(x < 0 ))> 0 | 
+      length(which(y < 0 ))  > 0 ) {
+    
+    stop ( "Dmax_positive: input vectors must be all zero or positive values.")  
+  } else {
+    
+    return ( Dmax( x, y))
+  }
+  
+}
+
+#' @param input_pcp_matrix: Uses the output from the 'read_input_pcp_file' function. It is a matrix with column names representing proteins and row names representing the PCP fraction number.
+#' @param number_of_threads: Number of CPUs dedicated to the analysis
+#' @value A numeric matrix
+run_dmax_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  number_of_threads)  { 
+  
+  tic()
+  list_of_pairs<- run_corr_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads, 
+  																	 .export=c('Dmax_positive', "Dmax"),
+  														.packages=c( 'tidyverse'),
+  														FUNC=Dmax_positive,
+  														protein_a_column="protein_a", protein_b_column="protein_b", 
+  														score_column="DMax")
+  toc()
+  
+  tic()
+  dmax_return_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix( list_of_pairs, "protein_a", "protein_b", "DMax", diagonal_score=1)
+  toc()
+  
+  return( dmax_return_matrix)
+  
+}
+```
+
+## NCC
+```{r}
+
+# By Loïc Thibalt (loic.thibaut@unsw.edu.au) 09/12/2018
+#' @name LT.crosscor
+#' @description Calculate the numeric cross-correlation. Calculate the similarity in two vectors if one series is shifted across in relation to the other.
+#' @param x A numeric vector 
+#' @param y A numeric vector of the same length as x
+#' @references https://docs.scipy.org/doc/numpy-1.14.0/reference/generated/numpy.correlate.html
+#' @value A numeric value
+LT.crosscor = function(x, y) {
+  
+  # arguments type & size should be checked
+  n = length(x)
+  
+  # dummy square matrix to build shift matrix  
+  A = matrix(0, n, n)
+  
+  # shift matrix
+  shift = pmax(row(A)-col(A) + 1, 0) + 1
+  
+  # shift x and y
+  shiftedX = matrix(c(0,x)[shift], n)
+  shiftedY = matrix(c(0,y)[shift], n)
+  
+  max(y %*% shiftedX, x %*% shiftedY)
+  
+}
+
+# By Loïc Thibalt (loic.thibaut@unsw.edu.au) 09/12/2018
+#' @name LT.NCC
+#' @description The normalized cross-correlation NCC was derived in 2 steps. First, we computed the maximum cross correlation between the two peak pairs P 1–2 CC. We then computed the maximum self-cross-correlation of the first peak (P 1 CC) and the max self-cross-correlation of the second peak (P 2 CC). The NCC was finally derived as P 1–2 CC/max(P 1 CC, P 2 CC). The NCC assume values between 0 and 1.
+#' @references: Larance M, et al. (2016) Global Membrane Protein Interactome Analysis using In vivo Crosslinking and Mass Spectrometry-based Protein Correlation Profiling. Mol Cell Proteomics. 15(7):2476-90., https://github.com/mtinti/score_signal/blob/master/scoring_matrix.py, https://docs.scipy.org/doc/numpy-1.14.0/reference/generated/numpy.correlate.html
+#' @param x A numeric vector 
+#' @param y A numeric vector of the same length as x
+#' @value A numeric value between 0 and 1, 1 means the two input vectors are similar, 0 means the two input vectors are not similar. 
+LT.NCC = function(x,y) {
+  LT.crosscor(x,y)/max(crossprod(x), crossprod(y))
+}
+
+
+run_ncc_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  number_of_threads)  { 
+	
+	tic()
+	list_of_pairs<- run_corr_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads, 
+																		 .export=c('LT.crosscor', "LT.NCC"),
+																		 .packages=c('tidyverse'),
+																		 FUNC=LT.NCC,
+																		 protein_a_column="protein_a", protein_b_column="protein_b", 
+																		 score_column="NCC")
+	toc()
+	
+	tic()
+	ncc_return_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix( list_of_pairs, "protein_a", "protein_b", "NCC", diagonal_score=1)
+	toc()
+	
+	return( ncc_return_matrix)
+	
+}
+
+```
+
+# Jaccard similarity
+```{r}
+
+#' @name jaccard_similarity
+#' @Descriptions Calculate the Jaccard similarity index. This is the number of fractions in which protein A and protein B are present divided by the number of fractions in which either protein A or B are present. (e.g. Jaccard similarity = | A intersect B | / | A union B |  )
+#' @param x A numeric vector 
+#' @param y A numeric vector of the same length as x
+#' @Wikipedia https://en.wikipedia.org/wiki/Jaccard_index
+jaccard_similarity <- function( x, y ) {
+	
+	if( length(x) != length(y) ) {
+		stop( paste0(as.list(sys.call())[[1]], ": length of x and y must be the same"))
+	}
+	
+	if( length (x) == 0 ) {
+		stop( paste0(as.list(sys.call())[[1]], ": length of x and y must be greater than zero"))
+	}
+	
+	# If Both X and Y are empty, then return 1
+	if( length(which(x != 0)) == 0 & length(which(y != 0)) == 0 ) {
+		
+		return( 1)
+	}
+
+	## Change to zerio if the data is NA
+	cleaned_data <- purrr::map( list(x=x, y=y),  ~ifelse(  is.na(.) , 0, .) )
+	
+	## In boty X and Y 
+	x_intersect_y <- length( which ( cleaned_data$x != 0 & cleaned_data$y != 0  )) 
+	
+	x_union_y <- length( which(  cleaned_data$x != 0 | cleaned_data$y != 0  ))
+	
+	jaccard_score <-  x_intersect_y / x_union_y 
+		
+	return( jaccard_score )
+	
+}
+
+
+run_jaccard_similarity_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  number_of_threads)  { 
+	
+	tic()
+	list_of_pairs<- run_corr_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads, 
+																		 .export=c('jaccard_similarity'),
+																		 .packages=c('tidyverse'),
+																		 FUNC=jaccard_similarity,
+																		 protein_a_column="protein_a", protein_b_column="protein_b", 
+																		 score_column="Jaccard")
+	toc()
+	
+	tic()
+	jaccard_return_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix( list_of_pairs, "protein_a", "protein_b", "Jaccard", diagonal_score=1)
+	toc()
+	
+	return( jaccard_return_matrix)
+	
+}
+```
+
+# Apex score
+```{r}
+
+#' @name apex_score
+#' @description If the maximum value of both vectors are in the same vector position (or PCP fraction), then return one, otherwise zero. 
+#' @param x A numeric vector 
+#' @param y A numeric vector of the same length as x
+#' @return Returns 0 or 1. 
+#' @references Havugimana PC et al (2012) A census of human soluble protein complexes. Cell 150(5):1068–1081. 
+apex_score <- function( x, y ) {
+	
+	if( length(x) != length(y) ) {
+		stop( paste0(as.list(sys.call())[[1]], ": length of x and y must be the same"))
+	}
+	
+	if( length (x) == 0 |  length (y) == 0 ) {
+		stop( paste0(as.list(sys.call())[[1]], ": length of x and y must be greater than zero"))
+	}
+	
+	cleaned_data <- purrr::map( list(x=x, y=y),  ~ifelse(  is.na(.) | is.nan(.) , 0, .) )
+	
+	position_max_x <- which( cleaned_data$x == max(cleaned_data$x))
+	position_max_y <- which(cleaned_data$y == max(cleaned_data$y))
+	common_peak_position <- intersect(position_max_x, position_max_y ) 
+	
+	if( length(common_peak_position) >=1 ) {
+		return(1)
+	} else {
+		return( 0 )
+	}
+
+}
+
+
+run_apex_score_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  number_of_threads)  { 
+	
+	tic()
+	list_of_pairs<- run_corr_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads, 
+																		 .export=c('apex_score'),
+																		 .packages=c('tidyverse'),
+																		 FUNC=jaccard_similarity,
+																		 protein_a_column="protein_a", protein_b_column="protein_b", 
+																		 score_column="Apex")
+	toc()
+	
+	tic()
+	apex_return_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix( list_of_pairs, "protein_a", "protein_b", "Apex", diagonal_score=1)
+	toc()
+	
+	return( apex_return_matrix)
+}
+```
+
+# Peak Score
+```{r}
+#' @name peak_score
+#' @description Find the distance in the number of fraction between the location of the highest peak for two vectors. 
+peak_score <- function( x, y )  {
+	
+	if( length(x) != length(y) ) {
+		stop( paste0(as.list(sys.call())[[1]], ": length of x and y must be the same"))
+	}
+	
+	if( length (x) == 0 |  length (y) == 0 ) {
+		stop( paste0(as.list(sys.call())[[1]], ": length of x and y must be greater than zero"))
+	}
+	
+	max_x_position <- which( x == max(x))[1]
+	max_y_position <- which( y== max(y))[1]
+	
+	return( abs( max_x_position - max_y_position))
+	
+}
+
+
+run_peak_score_on_one_matrix_foreach_focused <- function(input_pcp_matrix,  number_of_threads)  { 
+	
+	# list_of_pairs <- run_dcor_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads )
+	
+	# list_of_pairs <- dplyr::bind_cols(list_of_pairs,  data.frame( dcor=results) ) %>% as.data.frame()
+	tic()
+	list_of_pairs <- run_corr_on_one_matrix_foreach_focused_parallel_part(input_pcp_matrix,  number_of_threads, 
+																		  .export=c(), .packages=c(),  FUNC=peak_score,
+																		  protein_a_column="protein_a", protein_b_column="protein_b", 
+																		  score_column="Peak_score")	
+	toc()
+	
+	tic()
+	dcor_return_matrix <- run_cor_on_one_matrix_foreach_focused_edge_list_to_matrix( list_of_pairs, "protein_a", "protein_b", "Peak_score", diagonal_score=0)
+	toc()
+	
+	return( dcor_return_matrix)
+	
+}
+
+```
+
+
+
+# Function to calculate the correlation / scoring matrix between all pairs of proteins, given an input PCP table 
+```{r}
+#' @name format_input_pcp_matrix
+#' @description Convert the input matrix into a data.frame object for use in 'master_correlation_function'
+#' @param input_data_frame A data frame with the first column as file name, all other columns are LFQ values for eluted fractions ordered from first (left) to last (right) fractions. 
+#' @return A numeric matrix object with proteins as columns and fractions as names. 
+format_input_pcp_matrix <- function(input_data_frame) {
+  
+  input_row_names <- input_data_frame[,1]
+  input_col_names <- colnames( input_data_frame)[2:ncol(input_data_frame)]
+  
+  input_data_frame <- input_data_frame[,2:ncol(input_data_frame)] %>% as.matrix
+  
+  rownames(input_data_frame) <- input_row_names
+  colnames(input_data_frame ) <- input_col_names
+  
+  ## Remember to transpose the matrix so that we are comparing the proteins 
+  input_data_frame <- t( input_data_frame)
+  
+  return (input_data_frame )
+}
+
+
+
+#' @name read_input_pcp_file
+#' @description Convert the input file into a data.frame object for use in 'master_correlation_function'
+#' @param input_pcp_file A file with the first column as file name, all other columns are LFQ values for eluted fractions ordered from first (left) to last (right) fractions. 
+#' @return A numeric matrix object with proteins as columns and fractions as names. 
+read_input_pcp_file <- function( input_pcp_file ){
+  
+  input_data_frame <- read.table( input_pcp_file, sep="\t", header=TRUE)
+
+  input_matrix <- format_input_pcp_matrix(input_data_frame) 
+  
+  return (input_matrix )
+  
+}
+
+# Function: read_input_pcp_file
+# Description: Given text file and choice of correlation metric, save the correlation matrix as an R object.
+#'@param correlation_metric  Type of correlation metric, available choices are Pearson, Spearman, Kendall, MIC, Distance
+#'@param elution_profile_file A file with the first column as file name, all other columns are LFQ values for eluted fractions ordered from first (left) to last (right) fractions. 
+#'@param correlation_scores_file Full path of the output file
+#'@param number_of_threads Number of threads that are available for the function to use. 
+calculate_correlation_and_save_table <- function( correlation_metric, elution_profile_file, correlation_scores_file, number_of_threads, random_number_seed = 1985)  {
+  
+  if (!file.exists( correlation_scores_file) ) {
+
+    set.seed(random_number_seed, "L'Ecuyer-CMRG")
+    
+    print( "Do calculations")
+    input_matrix <- read_input_pcp_file( elution_profile_file )
+    
+    print ( head( input_matrix[1:10, 1:10]) ) 
+    
+    correlation_matrix <- master_correlation_function( input_matrix, type=correlation_metric, number_of_threads=number_of_threads )
+    
+    create_directory_if_not_exists( dirname(correlation_scores_file))
+  
+    saveRDS( correlation_matrix, file= correlation_scores_file )
+  }
+  
+}
+
+```
+
+
+
